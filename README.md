@@ -11,6 +11,7 @@ This repo provides a small Python helper to poll the ServiceNow Table API and ch
    - `SERVICENOW_INSTANCE_URL` (e.g., `https://example.service-now.com`)
    - `SERVICENOW_USERNAME`
    - `SERVICENOW_PASSWORD`
+   - `SERVICENOW_CA_BUNDLE` (optional, path to your private PKI bundle)
 
 ## Usage
 The `servicenow_poll.py` script supports one-shot checks and polling mode.
@@ -31,3 +32,4 @@ The script exits with status code `0` if the CR exists and `1` if not found, whi
 ## Notes
 - Authentication uses basic auth via the provided username and password.
 - Requests are made against the `/api/now/table/change_request` endpoint with a query filtered by the provided change number.
+- Use `--ca-bundle` or `SERVICENOW_CA_BUNDLE` to point to a custom CA file when your ServiceNow instance uses a private PKI.
