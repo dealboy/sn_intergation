@@ -10,16 +10,25 @@ import requests
 class ServiceNowClient:
     """Thin wrapper around the ServiceNow Table API for change requests."""
 
-    def __init__(self, instance_url: str, username: str, password: str):
+    def __init__(
+        self,
+        instance_url: str,
+        username: str,
+        password: str,
+        verify: Optional[str] = None,
+    ):
         if not instance_url:
             raise ValueError("instance_url is required")
         if not username or not password:
             raise ValueError("username and password are required")
+        if verify and not os.path.exists(verify):
+            raise ValueError(f"CA bundle path does not exist: {verify}")
 
         self.base_url = instance_url.rstrip("/")
         self.session = requests.Session()
         self.session.auth = (username, password)
         self.session.headers.update({"Accept": "application/json"})
+        self.session.verify = verify if verify is not None else True
 
     def fetch_change_request(self, number: str) -> Optional[dict]:
         """Return the first change request matching the number, if any."""
@@ -73,6 +82,11 @@ def parse_args() -> argparse.Namespace:
         help="ServiceNow password (or set SERVICENOW_PASSWORD)",
     )
     parser.add_argument(
+        "--ca-bundle",
+        default=os.getenv("SERVICENOW_CA_BUNDLE"),
+        help="Path to a CA bundle file for private PKI validation",
+    )
+    parser.add_argument(
         "--change-number",
         required=True,
         help="Change request number to look for (e.g. CHG0030001)",
@@ -104,7 +118,9 @@ def main() -> int:
     if not args.username or not args.password:
         raise SystemExit("ServiceNow credentials are required")
 
-    client = ServiceNowClient(args.instance_url, args.username, args.password)
+    client = ServiceNowClient(
+        args.instance_url, args.username, args.password, verify=args.ca_bundle
+    )
 
     if args.one_shot:
         exists = client.change_request_exists(args.change_number)
