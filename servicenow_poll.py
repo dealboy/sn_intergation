@@ -62,12 +62,23 @@ class ServiceNowClient:
         change_request_sys_id: str,
         short_description: str,
         work_notes: Optional[str] = None,
+        description: Optional[str] = None,
+        assignment_group: Optional[str] = None,
+        change_task_type: str = "Implementation",
     ) -> Dict[str, str]:
         """Create a change task attached to the provided change request."""
 
-        payload = {"change_request": change_request_sys_id, "short_description": short_description}
+        payload = {
+            "change_request": change_request_sys_id,
+            "short_description": short_description,
+            "change_task_type": change_task_type,
+        }
         if work_notes:
             payload["work_notes"] = work_notes
+        if description:
+            payload["description"] = description
+        if assignment_group:
+            payload["assignment_group"] = assignment_group
 
         response = self.session.post(
             f"{self.base_url}/api/now/table/change_task", json=payload, timeout=30
@@ -76,7 +87,26 @@ class ServiceNowClient:
         body = response.json()
         return body.get("result", {})
 
-    def close_change_task(self, change_task_sys_id: str, close_notes: Optional[str] = None) -> Dict[str, str]:
+    def update_change_request(
+        self, change_request_sys_id: str, fields: Dict[str, str]
+    ) -> Dict[str, str]:
+        response = self.session.patch(
+            f"{self.base_url}/api/now/table/change_request/{change_request_sys_id}",
+            json=fields,
+            timeout=30,
+        )
+        response.raise_for_status()
+        body = response.json()
+        return body.get("result", {})
+
+    def add_work_note_to_change_request(
+        self, change_request_sys_id: str, note: str
+    ) -> Dict[str, str]:
+        return self.update_change_request(change_request_sys_id, {"work_notes": note})
+
+    def close_change_task(
+        self, change_task_sys_id: str, close_notes: Optional[str] = None
+    ) -> Dict[str, str]:
         """Close a change task by moving it to a closed state with optional notes."""
 
         payload = {"state": "3"}  # 3 corresponds to "Closed Complete" in ServiceNow
@@ -93,23 +123,73 @@ class ServiceNowClient:
         return body.get("result", {})
 
 
+def normalize_change_request_state(state_value: Optional[str]) -> str:
+    """Return a normalized state value for comparison."""
+
+    if state_value is None:
+        return ""
+
+    state_str = str(state_value).strip().lower()
+    numeric_map = {"4": "scheduled", "5": "implement"}
+    if state_str in numeric_map:
+        return numeric_map[state_str]
+
+    if state_str.startswith("sched"):
+        return "scheduled"
+    if state_str.startswith("implement"):
+        return "implement"
+
+    return ""
+
+
+def prepare_change_request_for_task(
+    client: ServiceNowClient, change_request: dict
+) -> Optional[dict]:
+    """Ensure the change request is in Implement state before creating tasks."""
+
+    normalized_state = normalize_change_request_state(change_request.get("state"))
+    if normalized_state == "scheduled":
+        updated_request = client.update_change_request(
+            change_request["sys_id"], {"state": "5"}
+        )
+        change_request.update(updated_request)
+        change_request["state"] = updated_request.get("state", "5")
+        return change_request
+
+    if normalized_state == "implement":
+        return change_request
+
+    return None
+
+
 def create_and_close_change_task(
     client: ServiceNowClient,
     change_request: dict,
     short_description: str,
+    description: str,
     work_notes: str,
     close_notes: str,
 ) -> tuple[dict, dict]:
     """Create a change task under a change request, add notes, then close it."""
 
+    change_task_assignment_group = change_request.get("assignment_group")
+
     change_task = client.create_change_task(
         change_request["sys_id"],
         short_description,
+        description=description,
+        assignment_group=change_task_assignment_group,
         work_notes=work_notes,
     )
     change_task_sys_id = change_task.get("sys_id")
     if not change_task_sys_id:
         raise RuntimeError("ServiceNow response did not include a change task sys_id.")
+
+    change_task_number = change_task.get("number", "the new change task")
+    client.add_work_note_to_change_request(
+        change_request["sys_id"],
+        f"Automation created change task {change_task_number} for this change.",
+    )
 
     closed_task = client.close_change_task(change_task_sys_id, close_notes=close_notes)
     return change_task, closed_task
@@ -179,6 +259,11 @@ def parse_args() -> argparse.Namespace:
         help="Short description to use for the created change task",
     )
     parser.add_argument(
+        "--task-description",
+        default="Automation-generated change task description.",
+        help="Detailed description to use for the created change task",
+    )
+    parser.add_argument(
         "--task-work-notes",
         default="Change task created automatically.",
         help="Work notes to add to the created change task",
@@ -216,10 +301,21 @@ def main() -> int:
         if not args.create_task:
             return 0
 
+        original_state = normalize_change_request_state(record.get("state"))
+        prepared_request = prepare_change_request_for_task(client, record)
+        if not prepared_request:
+            print("Change request is not in the right state (Implement or Scheduled).")
+            return 1
+        if original_state == "scheduled":
+            print(
+                "Change request is Scheduled; moving it to Implement before creating tasks."
+            )
+
         change_task, closed_task = create_and_close_change_task(
             client,
-            record,
+            prepared_request,
             args.task_short_description,
+            args.task_description,
             args.task_work_notes,
             args.task_close_notes,
         )
@@ -249,10 +345,19 @@ def main() -> int:
     if not args.create_task:
         return 0
 
+    original_state = normalize_change_request_state(record.get("state"))
+    prepared_request = prepare_change_request_for_task(client, record)
+    if not prepared_request:
+        print("Change request is not in the right state (Implement or Scheduled).")
+        return 1
+    if original_state == "scheduled":
+        print("Change request is Scheduled; moving it to Implement before creating tasks.")
+
     change_task, closed_task = create_and_close_change_task(
         client,
-        record,
+        prepared_request,
         args.task_short_description,
+        args.task_description,
         args.task_work_notes,
         args.task_close_notes,
     )
