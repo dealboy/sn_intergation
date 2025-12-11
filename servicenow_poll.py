@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 import requests
 
@@ -57,6 +57,63 @@ class ServiceNowClient:
                 time.sleep(interval_seconds)
         return None
 
+    def create_change_task(
+        self,
+        change_request_sys_id: str,
+        short_description: str,
+        work_notes: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Create a change task attached to the provided change request."""
+
+        payload = {"change_request": change_request_sys_id, "short_description": short_description}
+        if work_notes:
+            payload["work_notes"] = work_notes
+
+        response = self.session.post(
+            f"{self.base_url}/api/now/table/change_task", json=payload, timeout=30
+        )
+        response.raise_for_status()
+        body = response.json()
+        return body.get("result", {})
+
+    def close_change_task(self, change_task_sys_id: str, close_notes: Optional[str] = None) -> Dict[str, str]:
+        """Close a change task by moving it to a closed state with optional notes."""
+
+        payload = {"state": "3"}  # 3 corresponds to "Closed Complete" in ServiceNow
+        if close_notes:
+            payload["close_notes"] = close_notes
+
+        response = self.session.patch(
+            f"{self.base_url}/api/now/table/change_task/{change_task_sys_id}",
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        body = response.json()
+        return body.get("result", {})
+
+
+def create_and_close_change_task(
+    client: ServiceNowClient,
+    change_request: dict,
+    short_description: str,
+    work_notes: str,
+    close_notes: str,
+) -> tuple[dict, dict]:
+    """Create a change task under a change request, add notes, then close it."""
+
+    change_task = client.create_change_task(
+        change_request["sys_id"],
+        short_description,
+        work_notes=work_notes,
+    )
+    change_task_sys_id = change_task.get("sys_id")
+    if not change_task_sys_id:
+        raise RuntimeError("ServiceNow response did not include a change task sys_id.")
+
+    closed_task = client.close_change_task(change_task_sys_id, close_notes=close_notes)
+    return change_task, closed_task
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -108,6 +165,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Check once instead of polling until the change request exists",
     )
+    parser.add_argument(
+        "--create-task",
+        action="store_true",
+        help=(
+            "When the change request is found, create a child change task, add notes, "
+            "and close it."
+        ),
+    )
+    parser.add_argument(
+        "--task-short-description",
+        default="Automated change task",
+        help="Short description to use for the created change task",
+    )
+    parser.add_argument(
+        "--task-work-notes",
+        default="Change task created automatically.",
+        help="Work notes to add to the created change task",
+    )
+    parser.add_argument(
+        "--task-close-notes",
+        default="Task closed automatically after creation.",
+        help="Close notes to add when closing the created change task",
+    )
     return parser.parse_args()
 
 
@@ -123,14 +203,32 @@ def main() -> int:
     )
 
     if args.one_shot:
-        exists = client.change_request_exists(args.change_number)
-        message = (
-            f"Change request {args.change_number} already exists."
-            if exists
-            else f"Change request {args.change_number} not found."
+        record = client.fetch_change_request(args.change_number)
+        if not record:
+            print(f"Change request {args.change_number} not found.")
+            if args.create_task:
+                print("Cannot create change task because the change request is not valid.")
+            return 1
+
+        print(f"Change request {args.change_number} already exists.")
+        print(json.dumps(record, indent=2, sort_keys=True))
+
+        if not args.create_task:
+            return 0
+
+        change_task, closed_task = create_and_close_change_task(
+            client,
+            record,
+            args.task_short_description,
+            args.task_work_notes,
+            args.task_close_notes,
         )
-        print(message)
-        return 0 if exists else 1
+        print("Change task created:")
+        print(json.dumps(change_task, indent=2, sort_keys=True))
+        print("Change task closed:")
+        print(json.dumps(closed_task, indent=2, sort_keys=True))
+
+        return 0
 
     print(
         f"Polling for change request {args.change_number} "
@@ -139,13 +237,31 @@ def main() -> int:
     record = client.poll_change_request(
         args.change_number, max_attempts=args.max_attempts, interval_seconds=args.interval_seconds
     )
-    if record:
-        print("Change request found:")
-        print(json.dumps(record, indent=2, sort_keys=True))
+    if not record:
+        print("Change request was not found before the maximum attempts were reached.")
+        if args.create_task:
+            print("Cannot create change task because the change request is not valid.")
+        return 1
+
+    print("Change request found:")
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+    if not args.create_task:
         return 0
 
-    print("Change request was not found before the maximum attempts were reached.")
-    return 1
+    change_task, closed_task = create_and_close_change_task(
+        client,
+        record,
+        args.task_short_description,
+        args.task_work_notes,
+        args.task_close_notes,
+    )
+    print("Change task created:")
+    print(json.dumps(change_task, indent=2, sort_keys=True))
+    print("Change task closed:")
+    print(json.dumps(closed_task, indent=2, sort_keys=True))
+
+    return 0
 
 
 if __name__ == "__main__":
